@@ -171,7 +171,9 @@ func Execute(ctx context.Context, in []Input, out []Output, strategy Strategy) e
 			case Broadcast:
 				for msg := range input.PullChannel(ctx) {
 					for _, output := range out {
+						wg.Add(1)
 						go func(output Output, message Message) {
+							defer wg.Done()
 							if err := output.Push(ctx, msg); err != nil {
 								slog.Error(fmt.Sprint("Failed to push message: ", err))
 								return
@@ -188,7 +190,9 @@ func Execute(ctx context.Context, in []Input, out []Output, strategy Strategy) e
 							if !ok {
 								return
 							}
+							wg.Add(1)
 							go func(output Output) {
+								defer wg.Done()
 								if err := output.Push(ctx, msg); err != nil {
 									slog.Error(fmt.Sprint("Failed to push message: ", err))
 									return

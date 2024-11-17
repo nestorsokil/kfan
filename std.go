@@ -23,7 +23,8 @@ func (s StdIn) PullChannel(context.Context) <-chan Message {
 			fmt.Printf("Error checking stdin: %v\n", err)
 			os.Exit(1)
 		}
-		if stat.Mode()&os.ModeCharDevice != 0 {
+		isInteractive := (stat.Mode() & os.ModeCharDevice) != 0
+		if isInteractive {
 			fmt.Println("Message format: <key>? [[header1=value1]]? message data")
 		}
 		scanner := bufio.NewScanner(os.Stdin)
@@ -52,15 +53,21 @@ func (s StdIn) PullChannel(context.Context) <-chan Message {
 					headers[keyValue[0]] = []byte(keyValue[1])
 				}
 			}
-			var acks int32
+			var callback func()
+			if isInteractive {
+				var acks int32
+				callback = func() {
+					atomic.AddInt32(&acks, 1)
+					fmt.Printf("[std:in] ACK (%d)\n", atomic.LoadInt32(&acks))
+				}
+			} else {
+				callback = func() {}
+			}
 			pipe <- Message{
 				Key:     key,
 				Headers: headers,
 				Value:   []byte(result["message"]),
-				Processed: func() {
-					atomic.AddInt32(&acks, 1)
-					fmt.Printf("[std:in] ACK (%d)\n", atomic.LoadInt32(&acks))
-				},
+				Processed: callback,
 			}
 		}
 		if err := scanner.Err(); err != nil {
