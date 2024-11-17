@@ -8,20 +8,15 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 )
 
-
-type StdIn struct {
-	pipe chan Message
-}
+type StdIn struct{}
 
 func (s StdIn) PullChannel(context.Context) <-chan Message {
-	if s.pipe != nil {
-		return s.pipe
-	}
-	s.pipe = make(chan Message, 100)
+	pipe := make(chan Message, 100)
 	go func() {
-		defer close(s.pipe)
+		defer close(pipe)
 		re := regexp.MustCompile(`^(?:<(?P<key>[^:]+)>)?\s?(?:\[\[(?P<headers>.*?)\]\])?\s?(?P<message>.+)$`)
 		stat, err := os.Stdin.Stat()
 		if err != nil {
@@ -32,12 +27,11 @@ func (s StdIn) PullChannel(context.Context) <-chan Message {
 			fmt.Println("Message format: <key>? [[header1=value1]]? message data")
 		}
 		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		for {
+		for scanner.Scan() {
 			line := scanner.Text()
-
-			fmt.Println("Read line", line)
-
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
 			match := re.FindStringSubmatch(line)
 			result := make(map[string]string)
 			for i, name := range re.SubexpNames() {
@@ -58,36 +52,29 @@ func (s StdIn) PullChannel(context.Context) <-chan Message {
 					headers[keyValue[0]] = []byte(keyValue[1])
 				}
 			}
-
-			var done chan struct{}
-			await := false
-			if !scanner.Scan() {
-				done = make(chan struct{})
-				await = true
-			}
-			s.pipe <- Message{
-				Key:       key,
-				Headers:   headers,
-				Value:     []byte(result["message"]),
-				processed: done,
-			}
-			if await {
-				<-done
-				break
+			var acks int32
+			pipe <- Message{
+				Key:     key,
+				Headers: headers,
+				Value:   []byte(result["message"]),
+				Processed: func() {
+					atomic.AddInt32(&acks, 1)
+					fmt.Printf("[std:in] ACK (%d)\n", atomic.LoadInt32(&acks))
+				},
 			}
 		}
 		if err := scanner.Err(); err != nil {
 			slog.Error(fmt.Sprintf("Error reading from stdin: %v", err))
 		}
 	}()
-	return s.pipe
+	return pipe
 }
 
 type StdOut struct {
 	PlusHeaders bool
 }
 
-func (s *StdOut) Push(ctx context.Context, msg Message) error {
+func (s StdOut) Push(ctx context.Context, msg Message) error {
 	if s.PlusHeaders && len(msg.Headers) > 0 {
 		var parts []string
 		for key, value := range msg.Headers {

@@ -23,11 +23,10 @@ const (
 )
 
 type Message struct {
-	Key     []byte
-	Value   []byte
-	Headers map[string][]byte
-
-	processed chan<- struct{}
+	Key       []byte
+	Value     []byte
+	Headers   map[string][]byte
+	Processed func()
 }
 
 type Input interface {
@@ -60,72 +59,67 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			brokers, _ := cmd.Flags().GetString("brokers")
 			group, _ := cmd.Flags().GetString("group")
-
+			
 			inputTopics, _ := cmd.Flags().GetString("in")
 			in := strings.Split(inputTopics, ",")
-
 			var inputs []Input
 			for _, topic := range in {
-				var input Input
 				if topic == "std:in" {
-					input = StdIn{}
-					inputs = append(inputs, input)
+					inputs = append(inputs, StdIn{})
 					if len(in) > 1 {
-						fmt.Println("std:in specified, ignoring other inputs")
+						slog.Warn("std:in specified, ignoring other inputs")
 					}
 					break
 				}
 				parsed := Parse(topic, `^(?:(?P<brokers>[^:]+):)?(?P<topic>[^#]+)#?(?P<group>.*)$`)
+				name := parsed["topic"]
 				if parsed["brokers"] != "" {
 					brokers = parsed["brokers"]
 				}
 				if parsed["group"] != "" {
 					group = parsed["group"]
 				}
-				name := parsed["topic"]
 				reset := "earliest"
 				if yes, _ := cmd.Flags().GetBool("from-tail"); yes {
 					reset = "latest"
 				}
-				input, err := NewConsumer(name, kafka.ConfigMap{
+				if input, err := NewConsumer(name, kafka.ConfigMap{
 					"bootstrap.servers":  brokers,
 					"group.id":           group,
 					"enable.auto.commit": false,
 					"auto.offset.reset":  reset,
-				})
-				if err != nil {
+				}); err == nil {
+					inputs = append(inputs, input)
+				} else {
 					fmt.Println(err)
 					os.Exit(1)
 				}
-				inputs = append(inputs, input)
-			}
 
+			}
 			outputTopics, _ := cmd.Flags().GetString("out")
 			out := strings.Split(outputTopics, ",")
 			var outputs []Output
 			for _, topic := range out {
-				var output Output
 				if strings.Contains(topic, "std:out") {
-					outputs = append(outputs, &StdOut{
+					outputs = append(outputs, StdOut{
 						PlusHeaders: strings.Contains(topic, "+headers"),
 					})
 					continue
 				}
 				parsed := Parse(topic, `^(?:(?P<brokers>[^:]+):)?(?P<topic>[^#]+)$`)
+				name := parsed["topic"]
 				if parsed["brokers"] != "" {
 					brokers = parsed["brokers"]
 				}
-				name := parsed["topic"]
-				output, err := NewProducer(name, kafka.ConfigMap{
+				if output, err := NewProducer(name, kafka.ConfigMap{
 					"bootstrap.servers": brokers,
-				})
-				if err != nil {
+				}); err == nil {
+					outputs = append(outputs, output)
+				} else {
 					fmt.Println(err)
 					os.Exit(1)
 				}
-				outputs = append(outputs, output)
 			}
-
 			strategy := Broadcast
 			if yes, _ := cmd.Flags().GetBool("round-robin"); yes {
 				strategy = RoundRobin
@@ -137,8 +131,8 @@ func main() {
 		},
 	}
 
-	rootCmd.Flags().StringP("in", "i", "", "Comma-separated inputs -- (broker?):topic or 'std:in'")
-	rootCmd.Flags().StringP("out", "o", "", "Comma-separated inputs -- (broker?):topic or 'std:out+headers'")
+	rootCmd.Flags().StringP("in", "i", "", "Comma-separated inputs -- (broker?):topic(#consumer-group?) or 'std:in'")
+	rootCmd.Flags().StringP("out", "o", "", "Comma-separated inputs -- (broker?):topic or 'std:out', 'std:out+headers'")
 	rootCmd.MarkFlagRequired("in")
 	rootCmd.MarkFlagRequired("out")
 
@@ -151,7 +145,7 @@ func main() {
 	rootCmd.Flags().StringP("brokers", "b", "localhost:9092", "Kafka brokers if applicable to both 'in' and 'out'")
 	viper.BindPFlag("brokers", rootCmd.Flags().Lookup("brokers"))
 	viper.BindEnv("brokers", "KFAN_BROKERS")
-	
+
 	rootCmd.Flags().StringP("group", "g", "kfan-group", "Consumer group ID")
 	viper.BindPFlag("group", rootCmd.Flags().Lookup("group"))
 	viper.BindEnv("group", "KFAN_GROUP")
@@ -176,19 +170,14 @@ func Execute(ctx context.Context, in []Input, out []Output, strategy Strategy) e
 			switch strategy {
 			case Broadcast:
 				for msg := range input.PullChannel(ctx) {
-					var wg sync.WaitGroup
 					for _, output := range out {
-						wg.Add(1)
-						go func(output Output) {
-							defer wg.Done()
+						go func(output Output, message Message) {
 							if err := output.Push(ctx, msg); err != nil {
 								slog.Error(fmt.Sprint("Failed to push message: ", err))
+								return
 							}
-						}(output)
-					}
-					wg.Wait()
-					if msg.processed != nil {
-						msg.processed <- struct{}{}
+							msg.Processed()
+						}(output, msg)
 					}
 				}
 			case RoundRobin:
@@ -199,13 +188,13 @@ func Execute(ctx context.Context, in []Input, out []Output, strategy Strategy) e
 							if !ok {
 								return
 							}
-							go func() {
+							go func(output Output) {
 								if err := output.Push(ctx, msg); err != nil {
 									slog.Error(fmt.Sprint("Failed to push message: ", err))
-								} else {
-									msg.processed <- struct{}{}
+									return
 								}
-							}()
+								msg.Processed()
+							}(output)
 						case <-ctx.Done():
 							return
 						}

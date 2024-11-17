@@ -10,55 +10,33 @@ import (
 	"github.com/pkg/errors"
 )
 
-func NewProducer(name string, config kafka.ConfigMap) (*TopicProducer, error) {
+func NewProducer(name string, config kafka.ConfigMap) (TopicProducer, error) {
 	slog.Debug(fmt.Sprint("Producing to topic ", name, " with producer config ", config))
 	p, err := kafka.NewProducer(&config)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create producer")
+		return TopicProducer{}, errors.Wrap(err, "failed to create producer")
 	}
-	return &TopicProducer{
+	return TopicProducer{
 		Name:     name,
 		producer: p,
 	}, nil
 }
 
-func (t *TopicProducer) Push(ctx context.Context, msg Message) error {
-	done := make(chan struct{})
+func (t TopicProducer) Push(ctx context.Context, msg Message) error {
 	deliveryChan := make(chan kafka.Event)
-	go func() {
-		defer close(deliveryChan)
-		for e := range deliveryChan {
-			switch ev := e.(type) {
-			case *kafka.Message:
-				if ev.TopicPartition.Error == nil {
-					slog.Debug(fmt.Sprintf("Delivered message to %s", t.Name))
-					done <- struct{}{}
-					return
-				}
-			}
-		}
-	}()
-	var kafkaHeaders []kafka.Header
-	for key, value := range msg.Headers {
-		kafkaHeaders = append(kafkaHeaders, kafka.Header{
-			Key:   key,
-			Value: value,
-		})
-	}
+	defer close(deliveryChan)
 	if err := t.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &t.Name, Partition: kafka.PartitionAny},
 		Value:          msg.Value,
 		Key:            msg.Key,
-		Headers:        kafkaHeaders,
+		Headers:        headers(msg.Headers),
 	}, deliveryChan); err != nil {
 		return errors.Wrap(err, "failed to produce message")
 	}
-
-	t.producer.Flush(1000)
-
 	slog.Debug(fmt.Sprintf("Pushed message to %s", t.Name))
-	<-done
-	return nil
+	event := <-deliveryChan
+	slog.Debug(fmt.Sprintf("Delivered message to %s", t.Name))
+	return errors.Wrap(event.(*kafka.Message).TopicPartition.Error, "failed to deliver message")
 }
 
 type TopicConsumer struct {
@@ -66,47 +44,59 @@ type TopicConsumer struct {
 	consumer *kafka.Consumer
 }
 
-func NewConsumer(name string, config kafka.ConfigMap) (*TopicConsumer, error) {
+func NewConsumer(name string, config kafka.ConfigMap) (TopicConsumer, error) {
 	consumer, err := kafka.NewConsumer(&config)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create consumer")
+		return TopicConsumer{}, errors.Wrap(err, "failed to create consumer")
 	}
 	slog.Debug(fmt.Sprint("Subscribing to topic ", name, " with consumer config ", config))
 	if err := consumer.SubscribeTopics([]string{name}, nil); err != nil {
-		return nil, errors.Wrap(err, "failed to subscribe to topic")
+		return TopicConsumer{}, errors.Wrap(err, "failed to subscribe to topic")
 	}
-	return &TopicConsumer{name, consumer}, nil
+	return TopicConsumer{name, consumer}, nil
 }
 
-func (t *TopicConsumer) PullChannel(ctx context.Context) <-chan Message {
-	pipe := make(chan Message, 100)
+func (t TopicConsumer) PullChannel(ctx context.Context) <-chan Message {
+	pipe := make(chan Message)
 	go func() {
 		defer close(pipe)
 		for {
-			msg, err := t.consumer.ReadMessage(time.Second) // todo configurable
+			msg, err := t.consumer.ReadMessage(10 * time.Second) // todo configurable
 			if err == nil {
 				slog.Debug(fmt.Sprintf("Read message on %s[%d]", t.Name, msg.TopicPartition.Partition))
-				genericHeaders := make(map[string][]byte, len(msg.Headers))
-				for _, header := range msg.Headers {
-					genericHeaders[header.Key] = header.Value
-				}
-				done := make(chan struct{})
 				pipe <- Message{
-					Key:       msg.Key,
-					Value:     msg.Value,
-					Headers:   genericHeaders,
-					processed: done,
+					Key:     msg.Key,
+					Value:   msg.Value,
+					Headers: headersAsMap(msg.Headers),
+					Processed: func() {
+						slog.Debug(fmt.Sprintf("Committing message on %s[%d]",
+							t.Name, msg.TopicPartition.Partition))
+						t.consumer.CommitMessage(msg)
+					},
 				}
-				go func() {
-					<-done
-					slog.Debug(fmt.Sprintf("Committing message on %s[%d]", t.Name, msg.TopicPartition.Partition))
-					t.consumer.CommitMessage(msg)
-				}()
 			} else if !err.(kafka.Error).IsTimeout() {
 				slog.Error(fmt.Sprintf("Consumer error: %v (%v)\n", err, msg))
 				break
+			} else if err.(kafka.Error).IsTimeout() {
+				slog.Debug(fmt.Sprintf("Consumer timeout: %v\n", err))
 			}
 		}
 	}()
 	return pipe
+}
+
+func headers(values map[string][]byte) []kafka.Header {
+	var kafkaHeaders []kafka.Header
+	for key, value := range values {
+		kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: key, Value: value})
+	}
+	return kafkaHeaders
+}
+
+func headersAsMap(headers []kafka.Header) map[string][]byte {
+	result := make(map[string][]byte, len(headers))
+	for _, header := range headers {
+		result[header.Key] = header.Value
+	}
+	return result
 }

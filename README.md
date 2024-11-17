@@ -14,7 +14,7 @@ Flags:
   -t, --from-tail        Start from the tail of the topic (use 'latest' instead of 'earliest')
   -g, --group string     Consumer group ID (default "kfan-group")
   -h, --help             help for kfan
-  -i, --in string        Comma-separated inputs -- (broker?):topic or 'std:in'
-  -o, --out string       Comma-separated inputs -- (broker?):topic or 'std:out+headers'
+  -i, --in string        Comma-separated inputs -- (broker?):topic(#consumer-group?) or 'std:in'
+  -o, --out string       Comma-separated inputs -- (broker?):topic or 'std:out', 'std:out+headers'
   -r, --round-robin      Round-robin strategy
 ```
